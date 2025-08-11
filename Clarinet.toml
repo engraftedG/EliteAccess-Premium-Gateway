@@ -1,0 +1,23 @@
+[project]
+name = "ffd"
+authors = []
+description = ""
+telemetry = false
+requirements = []
+cache_dir = "/home/runner/workspace/ffd/./.requirements"
+boot_contracts = ["pox", "costs-v2", "bns"]
+[contracts.EliteAccess-Premium-Gateway]
+path = "contracts/EliteAccess-Premium-Gateway.clar"
+
+[repl]
+costs_version = 2
+parser_version = 2
+
+[repl.analysis]
+passes = ["check_checker"]
+
+[repl.analysis.check_checker]
+strict = false
+trusted_sender = false
+trusted_caller = false
+callee_filter = false
