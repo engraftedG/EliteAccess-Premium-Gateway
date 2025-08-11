@@ -42,6 +42,17 @@
 (define-constant error-access-level-restricted (err u409))
 (define-constant error-subscription-renewal-failed (err u410))
 
+;; Additional error constants for input validation
+(define-constant error-invalid-tier-name (err u420))
+(define-constant error-invalid-monthly-price (err u421))
+(define-constant error-invalid-token-balance (err u422))
+(define-constant error-invalid-access-level (err u423))
+(define-constant error-invalid-token-type (err u424))
+(define-constant error-invalid-holding-period (err u425))
+(define-constant error-invalid-tier-boost (err u426))
+(define-constant error-invalid-duration (err u427))
+(define-constant error-invalid-principal (err u428))
+
 ;; =====================================================================================
 ;; CORE DATA STRUCTURES
 ;; =====================================================================================
@@ -112,6 +123,64 @@
 (define-data-var accumulated-platform-revenue uint u0)
 
 ;; =====================================================================================
+;; INPUT VALIDATION FUNCTIONS
+;; =====================================================================================
+
+;; Validate tier name is not empty and within length limits
+(define-private (validate-tier-name (name (string-ascii 32)))
+  (and 
+    (> (len name) u0)
+    (<= (len name) u32)))
+
+;; Validate monthly price is within reasonable bounds
+(define-private (validate-monthly-price (price uint))
+  (and 
+    (> price u0)
+    (<= price u1000000000000))) ;; 1,000,000 STX maximum (in micro-STX)
+
+;; Validate access level is within defined range
+(define-private (validate-access-level (level uint))
+  (and 
+    (>= level u1)
+    (<= level u100))) ;; Access level range 1-100
+
+;; Validate tier ID is within acceptable range
+(define-private (validate-tier-id (tier uint))
+  (and 
+    (>= tier tier-basic)
+    (<= tier tier-elite)))
+
+;; Validate token balance requirements
+(define-private (validate-token-balance (balance uint))
+  (<= balance u1000000000000000000)) ;; Reasonable maximum token balance
+
+;; Validate duration is within acceptable bounds
+(define-private (validate-duration-blocks (duration uint))
+  (and 
+    (> duration u0)
+    (<= duration u525600))) ;; Maximum ~10 years in blocks
+
+;; Validate holding period is reasonable
+(define-private (validate-holding-period (period uint))
+  (<= period u52560)) ;; Maximum 1 year
+
+;; Validate tier boost percentage
+(define-private (validate-tier-boost (boost uint))
+  (<= boost u1000)) ;; Maximum 1000% boost
+
+;; Validate token type is supported standard
+(define-private (validate-token-type (token-type (string-ascii 16)))
+  (or 
+    (is-eq token-type "sip009")
+    (is-eq token-type "sip010")))
+
+;; Validate renewal duration is reasonable
+(define-private (validate-renewal-duration (duration uint))
+  (and 
+    (> duration u0)
+    (<= duration u525600))) ;; Maximum ~10 years
+
+;; =====================================================================================
 ;; SUBSCRIPTION TIER INITIALIZATION FUNCTIONS
 ;; =====================================================================================
 
@@ -127,8 +196,12 @@
     ;; Verify administrative privileges for tier configuration
     (asserts! (is-eq tx-sender gateway-controller) error-unauthorized-administrator)
 
-    ;; Validate tier identifier within acceptable range
-    (asserts! (and (>= tier-id tier-basic) (<= tier-id tier-elite)) error-invalid-tier-selection)
+    ;; Validate all input parameters
+    (asserts! (validate-tier-id tier-id) error-invalid-tier-selection)
+    (asserts! (validate-tier-name tier-name) error-invalid-tier-name)
+    (asserts! (validate-monthly-price monthly-price) error-invalid-monthly-price)
+    (asserts! (validate-token-balance min-token-balance) error-invalid-token-balance)
+    (asserts! (validate-access-level access-level) error-invalid-access-level)
 
     ;; Store comprehensive tier configuration
     (map-set service-tier-configuration
@@ -154,6 +227,11 @@
     ;; Ensure only platform administrator can register tokens
     (asserts! (is-eq tx-sender gateway-controller) error-unauthorized-administrator)
 
+    ;; Validate all input parameters
+    (asserts! (validate-token-type token-type) error-invalid-token-type)
+    (asserts! (validate-holding-period holding-period) error-invalid-holding-period)
+    (asserts! (validate-tier-boost tier-boost) error-invalid-tier-boost)
+
     ;; Store token verification parameters
     (map-set verified-access-tokens
       { token-contract-address: token-address }
@@ -175,93 +253,102 @@
     (selected-tier uint)
     (duration-blocks uint)
     (token-verification-address (optional principal)))
-  (let
-    ((current-timestamp block-height)
-     (subscriber-principal tx-sender)
-     (tier-configuration (unwrap! (map-get? service-tier-configuration { tier-identifier: selected-tier }) error-invalid-tier-selection))
-     (subscription-cost (get monthly-cost-micro-stx tier-configuration))
-     (calculated-duration (calculate-subscription-duration duration-blocks))
-     (total-payment-required (calculate-total-payment subscription-cost calculated-duration)))
+  (begin
+    ;; Validate input parameters early
+    (asserts! (validate-tier-id selected-tier) error-invalid-tier-selection)
+    (asserts! (validate-duration-blocks duration-blocks) error-invalid-duration)
 
-    ;; Verify subscription service availability
-    (asserts! (var-get gateway-operational-status) error-access-level-restricted)
-    (asserts! (not (var-get emergency-pause-activated)) error-access-level-restricted)
+    (let
+      ((current-timestamp block-height)
+       (subscriber-principal tx-sender)
+       (tier-configuration (unwrap! (map-get? service-tier-configuration { tier-identifier: selected-tier }) error-invalid-tier-selection))
+       (subscription-cost (get monthly-cost-micro-stx tier-configuration))
+       (calculated-duration (calculate-subscription-duration duration-blocks))
+       (total-payment-required (calculate-total-payment subscription-cost calculated-duration)))
 
-    ;; Validate subscription tier availability
-    (asserts! (get tier-availability tier-configuration) error-invalid-tier-selection)
+      ;; Verify subscription service availability
+      (asserts! (var-get gateway-operational-status) error-access-level-restricted)
+      (asserts! (not (var-get emergency-pause-activated)) error-access-level-restricted)
 
-    ;; Check for existing active subscription
-    (asserts! (is-none (get-active-subscription subscriber-principal)) error-subscription-already-active)
+      ;; Validate subscription tier availability
+      (asserts! (get tier-availability tier-configuration) error-invalid-tier-selection)
 
-    ;; Process token verification if required
-    (match token-verification-address
-      token-contract
-      (try! (verify-token-eligibility subscriber-principal token-contract selected-tier))
-      true)
+      ;; Check for existing active subscription
+      (asserts! (is-none (get-active-subscription subscriber-principal)) error-subscription-already-active)
 
-    ;; Execute payment processing
-    (try! (stx-transfer? total-payment-required subscriber-principal (as-contract tx-sender)))
+      ;; Process token verification if required
+      (match token-verification-address
+        token-contract
+        (try! (verify-token-eligibility subscriber-principal token-contract selected-tier))
+        true)
 
-    ;; Create comprehensive subscription record
-    (map-set premium-member-registry
-      { subscriber-address: subscriber-principal }
-      {
-        membership-tier: selected-tier,
-        activation-timestamp: current-timestamp,
-        expiration-boundary: (+ current-timestamp calculated-duration),
-        payment-amount-locked: total-payment-required,
-        renewal-preference: false,
-        access-token-required: (default-to tx-sender token-verification-address),
-        subscription-status: u1
-      })
+      ;; Execute payment processing
+      (try! (stx-transfer? total-payment-required subscriber-principal (as-contract tx-sender)))
 
-    ;; Update platform revenue tracking
-    (var-set accumulated-platform-revenue 
-      (+ (var-get accumulated-platform-revenue) total-payment-required))
+      ;; Create comprehensive subscription record
+      (map-set premium-member-registry
+        { subscriber-address: subscriber-principal }
+        {
+          membership-tier: selected-tier,
+          activation-timestamp: current-timestamp,
+          expiration-boundary: (+ current-timestamp calculated-duration),
+          payment-amount-locked: total-payment-required,
+          renewal-preference: false,
+          access-token-required: (default-to tx-sender token-verification-address),
+          subscription-status: u1
+        })
 
-    ;; Increment subscription counter for analytics
-    (var-set subscription-sequence-counter 
-      (+ (var-get subscription-sequence-counter) u1))
+      ;; Update platform revenue tracking
+      (var-set accumulated-platform-revenue 
+        (+ (var-get accumulated-platform-revenue) total-payment-required))
 
-    (ok { 
-      subscription-id: (var-get subscription-sequence-counter),
-      tier: selected-tier,
-      expires-at: (+ current-timestamp calculated-duration)
-    })))
+      ;; Increment subscription counter for analytics
+      (var-set subscription-sequence-counter 
+        (+ (var-get subscription-sequence-counter) u1))
+
+      (ok { 
+        subscription-id: (var-get subscription-sequence-counter),
+        tier: selected-tier,
+        expires-at: (+ current-timestamp calculated-duration)
+      }))))
 
 ;; Subscription renewal mechanism with automatic payment processing
 (define-public (renew-subscription-membership (renewal-duration uint))
-  (let
-    ((subscriber-address tx-sender)
-     (existing-subscription (unwrap! (map-get? premium-member-registry { subscriber-address: subscriber-address }) error-subscription-nonexistent))
-     (current-tier (get membership-tier existing-subscription))
-     (tier-config (unwrap! (map-get? service-tier-configuration { tier-identifier: current-tier }) error-invalid-tier-selection))
-     (renewal-cost (get monthly-cost-micro-stx tier-config))
-     (calculated-extension (calculate-subscription-duration renewal-duration))
-     (total-renewal-payment (calculate-total-payment renewal-cost calculated-extension))
-     (current-expiration (get expiration-boundary existing-subscription))
-     (new-expiration (+ current-expiration calculated-extension)))
+  (begin
+    ;; Validate renewal duration input
+    (asserts! (validate-renewal-duration renewal-duration) error-invalid-duration)
 
-    ;; Verify subscription exists and is renewable
-    (asserts! (> (get subscription-status existing-subscription) u0) error-subscription-nonexistent)
+    (let
+      ((subscriber-address tx-sender)
+       (existing-subscription (unwrap! (map-get? premium-member-registry { subscriber-address: subscriber-address }) error-subscription-nonexistent))
+       (current-tier (get membership-tier existing-subscription))
+       (tier-config (unwrap! (map-get? service-tier-configuration { tier-identifier: current-tier }) error-invalid-tier-selection))
+       (renewal-cost (get monthly-cost-micro-stx tier-config))
+       (calculated-extension (calculate-subscription-duration renewal-duration))
+       (total-renewal-payment (calculate-total-payment renewal-cost calculated-extension))
+       (current-expiration (get expiration-boundary existing-subscription))
+       (new-expiration (+ current-expiration calculated-extension)))
 
-    ;; Process renewal payment
-    (try! (stx-transfer? total-renewal-payment subscriber-address (as-contract tx-sender)))
+      ;; Verify subscription exists and is renewable
+      (asserts! (> (get subscription-status existing-subscription) u0) error-subscription-nonexistent)
 
-    ;; Update subscription with extended duration
-    (map-set premium-member-registry
-      { subscriber-address: subscriber-address }
-      (merge existing-subscription {
-        expiration-boundary: new-expiration,
-        payment-amount-locked: (+ (get payment-amount-locked existing-subscription) total-renewal-payment),
-        subscription-status: u1
-      }))
+      ;; Process renewal payment
+      (try! (stx-transfer? total-renewal-payment subscriber-address (as-contract tx-sender)))
 
-    ;; Update platform revenue
-    (var-set accumulated-platform-revenue 
-      (+ (var-get accumulated-platform-revenue) total-renewal-payment))
+      ;; Update subscription with extended duration
+      (map-set premium-member-registry
+        { subscriber-address: subscriber-address }
+        (merge existing-subscription {
+          expiration-boundary: new-expiration,
+          payment-amount-locked: (+ (get payment-amount-locked existing-subscription) total-renewal-payment),
+          subscription-status: u1
+        }))
 
-    (ok new-expiration)))
+      ;; Update platform revenue
+      (var-set accumulated-platform-revenue 
+        (+ (var-get accumulated-platform-revenue) total-renewal-payment))
+
+      (ok new-expiration))))
 
 ;; =====================================================================================
 ;; ACCESS VERIFICATION FUNCTIONS
@@ -322,14 +409,18 @@
 
 ;; Token eligibility verification with tier requirements
 (define-private (verify-token-eligibility (user-address principal) (token-contract principal) (target-tier uint))
-  (let
-    ((token-config (unwrap! (map-get? verified-access-tokens { token-contract-address: token-contract }) error-token-requirement-unmet))
-     (tier-config (unwrap! (map-get? service-tier-configuration { tier-identifier: target-tier }) error-invalid-tier-selection)))
+  (begin
+    ;; Validate inputs
+    (asserts! (validate-tier-id target-tier) error-invalid-tier-selection)
 
-    ;; Verify token is active and user meets requirements
-    (asserts! (get verification-active token-config) error-token-requirement-unmet)
+    (let
+      ((token-config (unwrap! (map-get? verified-access-tokens { token-contract-address: token-contract }) error-token-requirement-unmet))
+       (tier-config (unwrap! (map-get? service-tier-configuration { tier-identifier: target-tier }) error-invalid-tier-selection)))
 
-    ;; Additional token balance verification would be implemented here
-    ;; depending on the specific token standard integration
+      ;; Verify token is active and user meets requirements
+      (asserts! (get verification-active token-config) error-token-requirement-unmet)
 
-    (ok true)))
+      ;; Additional token balance verification would be implemented here
+      ;; depending on the specific token standard integration
+
+      (ok true))))
