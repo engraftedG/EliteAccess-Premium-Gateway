@@ -123,6 +123,29 @@
 (define-data-var accumulated-platform-revenue uint u0)
 
 ;; =====================================================================================
+;; APPROVED PRINCIPALS REGISTRY
+;; =====================================================================================
+
+;; Registry of approved token contracts (for validation)
+(define-map approved-token-contracts
+  { contract-address: principal }
+  { approved: bool })
+
+;; Function to approve token contracts (admin only)
+(define-public (approve-token-contract (token-contract principal))
+  (begin
+    (asserts! (is-eq tx-sender gateway-controller) error-unauthorized-administrator)
+    (map-set approved-token-contracts { contract-address: token-contract } { approved: true })
+    (ok true)))
+
+;; Function to revoke token contract approval
+(define-public (revoke-token-contract (token-contract principal))
+  (begin
+    (asserts! (is-eq tx-sender gateway-controller) error-unauthorized-administrator)
+    (map-delete approved-token-contracts { contract-address: token-contract })
+    (ok true)))
+
+;; =====================================================================================
 ;; INPUT VALIDATION FUNCTIONS
 ;; =====================================================================================
 
@@ -180,6 +203,11 @@
     (> duration u0)
     (<= duration u525600))) ;; Maximum ~10 years
 
+;; NEW: Validate that a principal is an approved token contract
+(define-private (validate-token-contract (token-contract principal))
+  (default-to false 
+    (get approved (map-get? approved-token-contracts { contract-address: token-contract }))))
+
 ;; =====================================================================================
 ;; SUBSCRIPTION TIER INITIALIZATION FUNCTIONS
 ;; =====================================================================================
@@ -202,6 +230,13 @@
     (asserts! (validate-monthly-price monthly-price) error-invalid-monthly-price)
     (asserts! (validate-token-balance min-token-balance) error-invalid-token-balance)
     (asserts! (validate-access-level access-level) error-invalid-access-level)
+
+    ;; FIXED: Validate token contract if provided
+    (asserts! 
+      (match token-contract
+        some-token (validate-token-contract some-token)
+        true) ;; If none provided, validation passes
+      error-invalid-principal)
 
     ;; Store comprehensive tier configuration
     (map-set service-tier-configuration
@@ -232,6 +267,9 @@
     (asserts! (validate-holding-period holding-period) error-invalid-holding-period)
     (asserts! (validate-tier-boost tier-boost) error-invalid-tier-boost)
 
+    ;; FIXED: Validate token contract address
+    (asserts! (validate-token-contract token-address) error-invalid-principal)
+
     ;; Store token verification parameters
     (map-set verified-access-tokens
       { token-contract-address: token-address }
@@ -258,13 +296,24 @@
     (asserts! (validate-tier-id selected-tier) error-invalid-tier-selection)
     (asserts! (validate-duration-blocks duration-blocks) error-invalid-duration)
 
+    ;; FIXED: Validate token verification address if provided
+    (asserts!
+      (match token-verification-address
+        some-token (validate-token-contract some-token)
+        true) ;; If none provided, validation passes
+      error-invalid-principal)
+
     (let
       ((current-timestamp block-height)
        (subscriber-principal tx-sender)
        (tier-configuration (unwrap! (map-get? service-tier-configuration { tier-identifier: selected-tier }) error-invalid-tier-selection))
        (subscription-cost (get monthly-cost-micro-stx tier-configuration))
        (calculated-duration (calculate-subscription-duration duration-blocks))
-       (total-payment-required (calculate-total-payment subscription-cost calculated-duration)))
+       (total-payment-required (calculate-total-payment subscription-cost calculated-duration))
+       ;; FIXED: Use validated token address with safe default
+       (validated-token-address (match token-verification-address
+                                  some-token some-token
+                                  tx-sender))) ;; Safe default
 
       ;; Verify subscription service availability
       (asserts! (var-get gateway-operational-status) error-access-level-restricted)
@@ -294,7 +343,7 @@
           expiration-boundary: (+ current-timestamp calculated-duration),
           payment-amount-locked: total-payment-required,
           renewal-preference: false,
-          access-token-required: (default-to tx-sender token-verification-address),
+          access-token-required: validated-token-address,
           subscription-status: u1
         })
 
@@ -412,6 +461,7 @@
   (begin
     ;; Validate inputs
     (asserts! (validate-tier-id target-tier) error-invalid-tier-selection)
+    (asserts! (validate-token-contract token-contract) error-invalid-principal)
 
     (let
       ((token-config (unwrap! (map-get? verified-access-tokens { token-contract-address: token-contract }) error-token-requirement-unmet))
@@ -424,3 +474,29 @@
       ;; depending on the specific token standard integration
 
       (ok true))))
+
+;; =====================================================================================
+;; ADMINISTRATIVE FUNCTIONS
+;; =====================================================================================
+
+;; Check if a token contract is approved
+(define-read-only (is-token-contract-approved (token-contract principal))
+  (default-to false 
+    (get approved (map-get? approved-token-contracts { contract-address: token-contract }))))
+
+;; Get list of subscription details (for admin purposes)
+(define-read-only (get-subscription-details (user-address principal))
+  (map-get? premium-member-registry { subscriber-address: user-address }))
+
+;; Get tier configuration details
+(define-read-only (get-tier-configuration (tier-id uint))
+  (map-get? service-tier-configuration { tier-identifier: tier-id }))
+
+;; Get platform statistics
+(define-read-only (get-platform-stats)
+  {
+    total-subscriptions: (var-get subscription-sequence-counter),
+    total-revenue: (var-get accumulated-platform-revenue),
+    operational-status: (var-get gateway-operational-status),
+    emergency-pause: (var-get emergency-pause-activated)
+  })
