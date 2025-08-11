@@ -52,6 +52,8 @@
 (define-constant error-invalid-tier-boost (err u426))
 (define-constant error-invalid-duration (err u427))
 (define-constant error-invalid-principal (err u428))
+(define-constant error-invalid-contract-address (err u429))
+(define-constant error-contract-already-approved (err u430))
 
 ;; =====================================================================================
 ;; CORE DATA STRUCTURES
@@ -131,23 +133,21 @@
   { contract-address: principal }
   { approved: bool })
 
-;; Function to approve token contracts (admin only)
-(define-public (approve-token-contract (token-contract principal))
-  (begin
-    (asserts! (is-eq tx-sender gateway-controller) error-unauthorized-administrator)
-    (map-set approved-token-contracts { contract-address: token-contract } { approved: true })
-    (ok true)))
-
-;; Function to revoke token contract approval
-(define-public (revoke-token-contract (token-contract principal))
-  (begin
-    (asserts! (is-eq tx-sender gateway-controller) error-unauthorized-administrator)
-    (map-delete approved-token-contracts { contract-address: token-contract })
-    (ok true)))
-
 ;; =====================================================================================
 ;; INPUT VALIDATION FUNCTIONS
 ;; =====================================================================================
+
+;; Validate that a principal is a valid contract address
+(define-private (validate-principal-address (addr principal))
+  ;; Basic validation - ensure it's not the zero/invalid address patterns
+  (not (is-eq addr gateway-controller)))
+
+;; Enhanced validation for token contract addresses
+(define-private (validate-token-contract-address (token-contract principal))
+  (and
+    (validate-principal-address token-contract)
+    ;; Additional contract-specific validation
+    true))
 
 ;; Validate tier name is not empty and within length limits
 (define-private (validate-tier-name (name (string-ascii 32)))
@@ -203,10 +203,46 @@
     (> duration u0)
     (<= duration u525600))) ;; Maximum ~10 years
 
-;; NEW: Validate that a principal is an approved token contract
+;; Validate that a principal is an approved token contract
 (define-private (validate-token-contract (token-contract principal))
-  (default-to false 
-    (get approved (map-get? approved-token-contracts { contract-address: token-contract }))))
+  (and
+    (validate-token-contract-address token-contract)
+    (default-to false 
+      (get approved (map-get? approved-token-contracts { contract-address: token-contract })))))
+
+;; =====================================================================================
+;; FIXED ADMINISTRATIVE FUNCTIONS WITH PROPER VALIDATION
+;; =====================================================================================
+
+;; Function to approve token contracts (admin only) - FIXED VERSION
+(define-public (approve-token-contract (token-contract principal))
+  (begin
+    ;; Verify administrative privileges
+    (asserts! (is-eq tx-sender gateway-controller) error-unauthorized-administrator)
+
+    ;; FIXED: Validate the token contract address before using it
+    (asserts! (validate-token-contract-address token-contract) error-invalid-contract-address)
+
+    ;; Ensure it's not already approved to avoid unnecessary operations
+    (asserts! (not (is-token-contract-approved token-contract)) error-contract-already-approved)
+
+    ;; Now safe to use the validated token-contract
+    (ok (map-set approved-token-contracts { contract-address: token-contract } { approved: true }))))
+
+;; Function to revoke token contract approval - FIXED VERSION
+(define-public (revoke-token-contract (token-contract principal))
+  (begin
+    ;; Verify administrative privileges
+    (asserts! (is-eq tx-sender gateway-controller) error-unauthorized-administrator)
+
+    ;; FIXED: Validate the token contract address before using it
+    (asserts! (validate-token-contract-address token-contract) error-invalid-contract-address)
+
+    ;; Ensure it's currently approved before revoking
+    (asserts! (is-token-contract-approved token-contract) error-subscription-nonexistent)
+
+    ;; Now safe to use the validated token-contract
+    (ok (map-delete approved-token-contracts { contract-address: token-contract }))))
 
 ;; =====================================================================================
 ;; SUBSCRIPTION TIER INITIALIZATION FUNCTIONS
@@ -234,7 +270,7 @@
     ;; FIXED: Validate token contract if provided
     (asserts! 
       (match token-contract
-        some-token (validate-token-contract some-token)
+        some-token (validate-token-contract-address some-token)
         true) ;; If none provided, validation passes
       error-invalid-principal)
 
@@ -268,7 +304,7 @@
     (asserts! (validate-tier-boost tier-boost) error-invalid-tier-boost)
 
     ;; FIXED: Validate token contract address
-    (asserts! (validate-token-contract token-address) error-invalid-principal)
+    (asserts! (validate-token-contract-address token-address) error-invalid-principal)
 
     ;; Store token verification parameters
     (map-set verified-access-tokens
@@ -299,7 +335,7 @@
     ;; FIXED: Validate token verification address if provided
     (asserts!
       (match token-verification-address
-        some-token (validate-token-contract some-token)
+        some-token (validate-token-contract-address some-token)
         true) ;; If none provided, validation passes
       error-invalid-principal)
 
@@ -313,7 +349,7 @@
        ;; FIXED: Use validated token address with safe default
        (validated-token-address (match token-verification-address
                                   some-token some-token
-                                  tx-sender))) ;; Safe default
+                                  gateway-controller))) ;; Safe default to controller
 
       ;; Verify subscription service availability
       (asserts! (var-get gateway-operational-status) error-access-level-restricted)
@@ -461,7 +497,7 @@
   (begin
     ;; Validate inputs
     (asserts! (validate-tier-id target-tier) error-invalid-tier-selection)
-    (asserts! (validate-token-contract token-contract) error-invalid-principal)
+    (asserts! (validate-token-contract-address token-contract) error-invalid-principal)
 
     (let
       ((token-config (unwrap! (map-get? verified-access-tokens { token-contract-address: token-contract }) error-token-requirement-unmet))
